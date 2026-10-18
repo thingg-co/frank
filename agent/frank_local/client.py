@@ -211,26 +211,35 @@ class Client:
                 raise
         raise RuntimeError("unreachable")
 
-    def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, max_tokens: int | None = None) -> Iterator[tuple[str, Any]]:
-        """Yield ('reasoning', str) | ('text', str) | ('done', Turn)."""
+    def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, max_tokens: int | None = None, stop: Any = None) -> Iterator[tuple[str, Any]]:
+        """Yield ('reasoning', str) | ('text', str) | ('done', Turn).
+
+        stop, when given, is called between chunks; if it returns true the
+        stream is cut off there and the partial turn is yielded as usual.
+        """
         kw = self._kwargs(messages, tools, max_tokens)
         kw["stream"] = True
         kw["stream_options"] = {"include_usage": True}
         acc = StreamAccumulator()
         turn = Turn()
         stream = self._call(self._oa.chat.completions.create, **kw)
-        for chunk in stream:
-            if getattr(chunk, "usage", None):
-                u = chunk.usage
-                turn.usage = {"prompt_tokens": u.prompt_tokens or 0, "completion_tokens": u.completion_tokens or 0}
-            if not chunk.choices:
-                continue
-            choice = chunk.choices[0]
-            if choice.delta is not None:
-                for ev in acc.feed(choice.delta):
-                    yield ev
-            if choice.finish_reason:
-                turn.finish_reason = choice.finish_reason
+        try:
+            for chunk in stream:
+                if stop is not None and stop():
+                    break
+                if getattr(chunk, "usage", None):
+                    u = chunk.usage
+                    turn.usage = {"prompt_tokens": u.prompt_tokens or 0, "completion_tokens": u.completion_tokens or 0}
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.delta is not None:
+                    for ev in acc.feed(choice.delta):
+                        yield ev
+                if choice.finish_reason:
+                    turn.finish_reason = choice.finish_reason
+        finally:
+            stream.close()
         for ev in acc.finish():
             yield ev
         turn.text = acc.text

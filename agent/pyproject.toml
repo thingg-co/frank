@@ -1,6 +1,6 @@
 [project]
 name = "frank-local"
-version = "0.3.0"
+version = "0.4.0"
 description = "A terminal coding agent with tool calling, for a local OpenAI-compatible model server (llama.cpp on a DGX Spark)."
 requires-python = ">=3.11"
 license = "PolyForm-Noncommercial-1.0.0"

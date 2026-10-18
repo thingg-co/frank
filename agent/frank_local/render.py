@@ -22,9 +22,14 @@ class UI:
         self.quiet = bool(prefix)  # subagents do not stream their prose
         self._in_text = False
         self._in_reasoning = False
+        # the terminal repl sets this so permission questions come back to the
+        # prompt thread, which is the only one that reads stdin
+        self.permission_router = None
 
     def child(self) -> "UI":
-        return UI(self.console, show_thinking=self.show_thinking, interactive=self.interactive, prefix=self.prefix + "  > ")
+        c = UI(self.console, show_thinking=self.show_thinking, interactive=self.interactive, prefix=self.prefix + "  > ")
+        c.permission_router = self.permission_router
+        return c
 
     # --- streaming assistant output ---------------------------------------
     def text(self, s: str) -> None:
@@ -70,6 +75,8 @@ class UI:
         self.turn_end()
         if not self.interactive:
             return "n"
+        if self.permission_router is not None:
+            return self.permission_router(name, summary, detail)
         self.console.print(Panel(escape(detail), title=f"{name} wants to run", border_style="yellow", expand=False))
         try:
             return input("allow? [y]es / [n]o / [a]lways for this tool: ")

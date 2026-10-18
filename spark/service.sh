@@ -3,7 +3,7 @@
 # linger is already enabled on the Spark). `bg` is a no-systemd fallback that
 # uses nohup and a pid file under run/.
 #
-#   spark/service.sh install            # write units into ~/.config/systemd/user; only the two pages start at boot
+#   spark/service.sh install            # write units into ~/.config/systemd/user; nothing starts at boot
 #   spark/service.sh start|stop|restart|status|logs [main|sidekick]
 #   spark/service.sh switch glm-4.5-air # change MODEL in config/spark.env and restart main
 #   spark/service.sh bg [main|sidekick] # run detached without systemd
@@ -24,9 +24,8 @@ case "$cmd" in
             sed "s#@ROOT@#$ROOT#g" "$ROOT/spark/$u.service" > "$HOME/.config/systemd/user/$u.service"
         done
         systemctl --user daemon-reload
-        # Model servers never start at boot (see llama-server.service); the two pages do.
-        systemctl --user disable llama-server.service llama-sidekick.service >/dev/null 2>&1 || true
-        systemctl --user enable frank-panel.service frank-chat.service >/dev/null
+        # Nothing starts at boot (see llama-server.service): every unit is started by hand.
+        systemctl --user disable llama-server.service llama-sidekick.service frank-panel.service frank-chat.service >/dev/null 2>&1 || true
         loginctl enable-linger "$USER" 2>/dev/null || warn "could not enable linger (try: sudo loginctl enable-linger $USER); services stop at logout without it"
         log "installed; start with: spark/service.sh start"
         ;;

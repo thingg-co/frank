@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -19,6 +21,16 @@ from .tools import Registry, ToolContext, ToolResult, build_registry, truncate_m
 
 COMPACT_NOTE = "[context compacted] Summary of the session so far:\n\n"
 CHARS_PER_TOKEN = 3.5
+
+
+class TurnInterrupted(Exception):
+    """The user stopped the turn from the prompt. mode is "" for a plain stop
+    (Ctrl-C), "clarification" or "instruction" for what was typed instead."""
+
+    def __init__(self, mode: str = "", text: str = ""):
+        super().__init__(mode, text)
+        self.mode = mode
+        self.text = text
 
 
 class Agent:
@@ -56,6 +68,67 @@ class Agent:
         self.last_usage: dict[str, int] = {}
         self._floor = 1  # len(messages) right after the last compaction; blocks back-to-back compactions
         self.owner = "the terminal"  # named in the lock, so the other side can say who has the session
+        # The prompt thread interrupts a running turn through these; the turn
+        # thread checks interrupt between chunks and drains at each step
+        # boundary (see _turn_loop). _incoming holds messages to send when the
+        # turn finishes; an interrupt carries its own message instead.
+        self.interrupt = threading.Event()
+        self._incoming: deque[tuple[str, str]] = deque()
+        self._interrupt_msg: tuple[str, str] | None = None
+        self._send_now_flag = False
+        self._int_lock = threading.Lock()
+
+    # ---- interrupts from the prompt ---------------------------------------
+    def _interrupt(self, mode: str, text: str) -> None:
+        """Stop the running turn now and send this message (a clarification)."""
+        with self._int_lock:
+            self.interrupt.set()
+            self._interrupt_msg = (mode, text)
+
+    def _queue_later(self, text: str) -> None:
+        """Queue a message to send when the current turn finishes, without stopping it."""
+        with self._int_lock:
+            self._incoming.append(("instruction", text))
+
+    def _send_now(self) -> None:
+        """Stop the turn now and send the queued message."""
+        with self._int_lock:
+            self.interrupt.set()
+            self._send_now_flag = True
+
+    def _stop(self) -> None:
+        """Stop the running turn without sending anything (Ctrl-C, Esc)."""
+        with self._int_lock:
+            self.interrupt.set()
+
+    def has_pending(self) -> bool:
+        with self._int_lock:
+            return self._interrupt_msg is not None or bool(self._incoming)
+
+    def _drain(self, *, queue_too: bool = True) -> tuple[str, str] | None:
+        """What to send after the turn stopped. An interrupt's own message goes
+        first; queue_too also pops the send-later queue (the step boundaries
+        use it, a plain stop does not)."""
+        with self._int_lock:
+            self.interrupt.clear()
+            msg, self._interrupt_msg = self._interrupt_msg, None
+            if msg is not None:
+                return msg
+            if queue_too or self._send_now_flag:
+                self._send_now_flag = False
+                try:
+                    return self._incoming.popleft()
+                except IndexError:
+                    return None
+            return None
+
+    def _reset_interrupt(self) -> None:
+        """A fresh turn starts with no pending interrupts."""
+        with self._int_lock:
+            self.interrupt.clear()
+            self._interrupt_msg = None
+            self._send_now_flag = False
+            self._incoming.clear()
 
     # ---- history ----------------------------------------------------------
     def load_history(self, messages: list[dict[str, Any]]) -> None:
@@ -121,10 +194,10 @@ class Agent:
     # ---- main loop ----------------------------------------------------------
     def run_turn(self, user_text: str) -> str:
         with self.hold():
-            return self._run_turn(user_text)
+            self._record({"role": "user", "content": user_text})
+            return self._turn_loop()
 
-    def _run_turn(self, user_text: str) -> str:
-        self._record({"role": "user", "content": user_text})
+    def _turn_loop(self) -> str:
         final = ""
         overflows = 0
         for _ in range(self.settings.max_iterations):
@@ -137,20 +210,30 @@ class Agent:
                     raise
                 self.compact(hard=True)
                 continue
+            if turn is None:  # the stream stopped: hand whatever the user sent back
+                pending = self._drain(queue_too=False)  # a plain stop keeps the queue for later
+                raise TurnInterrupted(*pending) if pending else TurnInterrupted()
             final = turn.text
             if not turn.tool_calls:
-                return final
+                pending = self._drain()  # typed in the last chunk, after the turn finished
+                if pending is None:
+                    return final
+                raise TurnInterrupted(*pending)
             for tc in turn.tool_calls:
                 self._execute_tool(tc)
+            pending = self._drain()  # typed while the tools ran
+            if pending is not None:
+                raise TurnInterrupted(*pending)
         self.ui.warn(f"stopped after {self.settings.max_iterations} tool rounds in one turn")
         return final
 
-    def _step(self) -> Turn:
+    def _step(self) -> Turn | None:
+        """One model request. None when the user interrupted the stream."""
         tools = self.registry.schemas() or None
         turn: Turn | None = None
         # never ask for more than the window has left, or the server rejects the request
         room = self.context_window - max(self.tokens_used(), self.estimate_tokens()) - 2048
-        for kind, payload in self.client.stream(self.messages, tools, max_tokens=max(1024, min(self.settings.max_tokens, room))):
+        for kind, payload in self.client.stream(self.messages, tools, max_tokens=max(1024, min(self.settings.max_tokens, room)), stop=self.interrupt.is_set):
             if kind == "text":
                 self.ui.text(payload)
             elif kind == "reasoning":
@@ -158,6 +241,9 @@ class Agent:
             elif kind == "done":
                 turn = payload
         self.ui.turn_end()
+        if self.interrupt.is_set():
+            self.ui.warn("interrupted")
+            return None
         assert turn is not None
         if turn.usage:
             self.last_usage = turn.usage

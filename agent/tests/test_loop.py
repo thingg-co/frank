@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from frank_local.client import ToolCall, Turn
 from frank_local.config import Settings
-from frank_local.loop import COMPACT_NOTE, Agent
+from frank_local.loop import COMPACT_NOTE, Agent, TurnInterrupted
+from frank_local.session import Session
 
 
 class FakeClient:
@@ -17,7 +20,7 @@ class FakeClient:
         self.requests = []
         self.completions = []
 
-    def stream(self, messages, tools=None, max_tokens=None):
+    def stream(self, messages, tools=None, max_tokens=None, stop=None):
         self.requests.append([dict(m) for m in messages])
         turn = self.turns.pop(0)
         turn.usage = dict(self.usage)
@@ -54,6 +57,96 @@ def test_tool_round_trip(tmp_path, ui):
     assert agent.messages[3]["tool_call_id"] == "c1" and "hi there" in agent.messages[3]["content"]
     # second request carried the tool result
     assert client.requests[1][3]["role"] == "tool"
+
+
+def test_interrupt_raises_turn_interrupted_and_repairs(tmp_path, ui):
+    client = FakeClient([Turn(text="first answer"), Turn(text="second answer")])
+    agent = make_agent(tmp_path, client, ui)
+    agent.session = Session.new(tmp_path, tmp_path, "fake")  # the repl always has one; hold() repairs on interrupt
+    agent._interrupt("clarification", "wait, use tabs")
+    with pytest.raises(TurnInterrupted) as ei:
+        agent.run_turn("do the thing")
+    e = ei.value
+    assert e.mode == "clarification" and e.text == "wait, use tabs"
+    # the interrupted turn was repaired, so the clarification can follow it
+    assert agent.messages[-1]["role"] == "assistant"
+    assert agent.messages[-1]["content"] == "[interrupted]"
+    # a fresh turn works normally afterwards
+    assert agent.run_turn("continue") == "second answer"
+
+
+def test_plain_stop_interrupts_without_message(tmp_path, ui):
+    client = FakeClient([Turn(text="a")])
+    agent = make_agent(tmp_path, client, ui)
+    agent._stop()
+    with pytest.raises(TurnInterrupted) as ei:
+        agent.run_turn("go")
+    assert ei.value.mode == ""
+
+
+def test_queue_later_sends_after_the_turn(tmp_path, ui):
+    client = FakeClient([Turn(text="first answer"), Turn(text="second answer")])
+    agent = make_agent(tmp_path, client, ui)
+    agent._queue_later("now do the other thing")
+    with pytest.raises(TurnInterrupted) as ei:
+        agent.run_turn("do the thing")
+    assert ei.value.mode == "instruction" and ei.value.text == "now do the other thing"
+    assert not agent.has_pending()
+
+
+def test_send_now_sends_the_queued_message(tmp_path, ui):
+    client = FakeClient([Turn(text="a"), Turn(text="b")])
+    agent = make_agent(tmp_path, client, ui)
+    agent._queue_later("send me now")
+    agent._send_now()
+    with pytest.raises(TurnInterrupted) as ei:
+        agent.run_turn("go")
+    assert ei.value.text == "send me now"
+    assert not agent.has_pending()
+
+
+def test_plain_stop_keeps_the_queue(tmp_path, ui):
+    client = FakeClient([Turn(text="a")])
+    agent = make_agent(tmp_path, client, ui)
+    agent._queue_later("still wanted")
+    agent._stop()
+    with pytest.raises(TurnInterrupted) as ei:
+        agent.run_turn("go")
+    assert ei.value.mode == ""  # the turn stopped
+    assert agent.has_pending()  # the queued message survived for the next turn
+    assert agent._drain() == ("instruction", "still wanted")
+
+
+def test_reset_interrupt_clears_pending(tmp_path, ui):
+    client = FakeClient([Turn(text="a")])
+    agent = make_agent(tmp_path, client, ui)
+    agent._interrupt("instruction", "no wait")
+    agent._reset_interrupt()
+    assert agent.run_turn("go") == "a"
+    assert not agent.interrupt.is_set()
+
+
+def test_interrupt_after_tools_is_drained(tmp_path, ui):
+    (tmp_path / "hello.txt").write_text("hi there\n")
+    client = FakeClient([
+        Turn(text="", tool_calls=[ToolCall(id="c1", name="read_file", arguments=json.dumps({"path": "hello.txt"}))]),
+        Turn(text="done"),
+    ])
+    agent = make_agent(tmp_path, client, ui)
+    tool = agent.registry.get("read_file")
+    orig_run = tool.run
+
+    def run(args, ctx):
+        result = orig_run(args, ctx)
+        agent._interrupt("instruction", "stop and do it differently")  # lands in the drain after the tools
+        return result
+
+    tool.run = run
+    with pytest.raises(TurnInterrupted) as ei:
+        agent.run_turn("read the file")
+    assert ei.value.mode == "instruction" and ei.value.text == "stop and do it differently"
+    # the tool result is still in the history, so the next turn can build on it
+    assert agent.messages[-1]["role"] == "tool"
 
 
 def test_unknown_tool_and_bad_json(tmp_path, ui):

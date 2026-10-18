@@ -1,5 +1,5 @@
 # systemd user unit for frank's chat page (bin/frank --web), on the sessions the frank
-# command keeps. Like the control page it starts at boot and needs no model: until a
+# command keeps. Like the control page it is started by hand and needs no model: until a
 # model server is up it says so on the page. It listens where PANEL_HOST says.
 [Unit]
 Description=frank chat page

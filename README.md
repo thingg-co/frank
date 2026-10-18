@@ -331,8 +331,6 @@ Five ways to serve, one port:
     spark/ds4.sh               DeepSeek V4 Flash on ds4: fetch | build | serve
     spark/serve.sh             llama-server for a profile (main, sidekick, or any key)
     spark/service.sh           systemd user units for the llama.cpp instances
-    spark/oom-reboot.sh        (sudo) reboot instead of hanging when memory runs out
-    spark/memwatch.sh          the memory-stall watch that oom-reboot.sh installs
     spark/headless.sh          (sudo) bring the Wi-Fi back when it waits for a password nobody types
     spark/wifiwatch.sh         the Wi-Fi check that headless.sh installs
     spark/panel.py             control page: status, profile and context switch, connection strings
@@ -349,6 +347,7 @@ Five ways to serve, one port:
     scripts/results.py         rank the results; --publish writes docs/results.json and the tables
     scripts/clef-test.py       the recall test for a decision model: multiple choice and claims to check
     bin/frank                  frank in the current directory, pointed at the server; tmux over SSH
+    bin/frank-start            pick one model (and the pages) to start, then bin/frank
     agent/                     frank, the agent (see agent/README.md)
     docs/                      the project page, served by GitHub Pages
     claude-code/               run Claude Code against the Spark
@@ -373,8 +372,8 @@ container image (37 GB) and the weights of the profile in `config/spark.env`
 (22 GB for Qwen3.8-27B, 133 GB for Flash-Next), installs systemd user units,
 starts the model server, waits for the health check and runs the smoke test.
 Nothing needs sudo; linger is already on, so the services outlive the SSH
-session. Only the control page starts at boot. A model server starts when
-someone asks for it (`spark/service.sh start`, the page, a bake) and never
+session. Nothing starts at boot. The pages and the model server start when
+someone asks for them (`spark/service.sh start`, the page, a bake) and never
 restarts itself.
 Rerunning it is safe. The downloads are the slow part: this Spark gets 20 to
 30 MB/s from Hugging Face, so a 100 GB model takes an hour or more.
@@ -414,6 +413,14 @@ over the network:
     ssh omega.local
     cd ~/Development/steel
     frank                             # or frank -c to resume the last session here
+
+Nothing is loaded after the Spark starts. `frank-start` lists the downloaded
+models with the memory each wants free, and the two pages. It starts the one
+model you pick and the pages you pick, nothing else, waits until the model
+answers and runs `frank` with whatever options it was given. Picking another
+model stops the one that is running; the pick goes into `config/spark.env`, and
+a model that leaves less than `SAFETY_GB` free once loaded is stopped again.
+`--server` stops before the agent.
 
 Run in your home folder, it lists `~/Development`, most recently changed
 first, and starts in the one you pick. Paste a git URL at that prompt, or run
@@ -492,7 +499,7 @@ Each chat runs its agent in a process of its own, so Stop works the way Ctrl-C
 does, the model request or the shell command included. Slash commands work in
 the message box too; `/clear` starts a new chat.
 
-Like the control page it starts at boot, needs no model to be running, and
+Like the control page it is started by hand, needs no model to be running, and
 listens where `PANEL_HOST` says, so it is on the LAN with the shipped config.
 There is no login. Anyone who can reach port 8089 can have the agent run
 commands on the Spark as you. `PANEL_HOST=127.0.0.1` keeps both pages to the
@@ -545,25 +552,23 @@ loads nothing. It also makes room five minutes (`LEAD_MIN`) before a timer in
 `NEIGHBOUR_TIMERS` fires (`flint.timer`), and measures again later the model
 it stopped.
 
-When the Spark ran out of memory it did not recover by itself: the kernel kept
-swapping and the GPU driver's allocations failed, and the OOM killer acted
-hours later or not at all. `sudo spark/oom-reboot.sh install` makes it reboot
-instead. Running out of memory, a task stuck in the kernel for two minutes, or
-a minute of the whole machine waiting on memory each lead to a reboot, and the
-hardware watchdog resets the board if systemd itself stops. Since model
-servers don't start at boot, it comes back with nothing loaded.
-`spark/oom-reboot.sh status` shows the settings.
+Nothing here reboots the Spark when memory runs out; the kernel's OOM killer
+handles it. A watchdog that rebooted the machine instead was taken out on
+2026-10-18, after it rebooted it over a model that had run out of room next
+to `steel`'s training. What keeps memory from running out is one model at a
+time with `SAFETY_GB` to spare, and room for the neighbours.
 
-Coming back is not the same as being reachable. The Spark is on Wi-Fi, and when
-a Wi-Fi handshake fails NetworkManager takes the saved password for wrong and
-asks for a new one. After the restart on 2026-10-16 the first handshakes timed
-out, the login screen's password box took the request, and the Spark stayed
-off the network for 16 hours until someone logged in. `sudo spark/headless.sh
-install` adds a root timer that checks the Wi-Fi every minute. When it has
-been waiting for a password, failed or disconnected on two checks in a row, it
-connects it again, and NetworkManager uses the saved password. A radio turned
-off with `nmcli radio wifi off` is left alone. `spark/headless.sh status` shows
-it. A cable to the router would make all of this unnecessary.
+Coming back from a restart is not the same as being reachable. The Spark is on
+Wi-Fi, and when a Wi-Fi handshake fails NetworkManager takes the saved password
+for wrong and asks for a new one. After the restart on 2026-10-16 the first
+handshakes timed out, the login screen's password box took the request, and the
+Spark stayed off the network for 16 hours until someone logged in. `sudo
+spark/headless.sh install` adds a root timer that checks the Wi-Fi every
+minute. When it has been waiting for a password, failed or disconnected on two
+checks in a row, it connects it again, and NetworkManager uses the saved
+password. A radio turned off with `nmcli radio wifi off` is left alone.
+`spark/headless.sh status` shows it. A cable to the router would make all of
+this unnecessary.
 
 ## The agent
 

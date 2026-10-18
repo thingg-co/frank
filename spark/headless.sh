@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keep the Spark on the network with nobody at it. Like oom-reboot.sh, this needs root:
+# Keep the Spark on the network with nobody at it. Unlike the rest of spark/, this needs root:
 #
 #   sudo spark/headless.sh install     # or uninstall
 #   spark/headless.sh status

@@ -50,7 +50,7 @@ def test_an_interrupted_turn_is_repaired_before_the_lock_goes(tmp_path, ui):
     s = Session.new(tmp_path, tmp_path, "m")
 
     class Stopping(FakeClient):
-        def stream(self, messages, tools=None, max_tokens=None):
+        def stream(self, messages, tools=None, max_tokens=None, stop=None):
             raise KeyboardInterrupt
             yield
 

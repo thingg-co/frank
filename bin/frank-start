@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# frank-start: pick what to run on the Spark, start it, then start frank in the current
+# directory. Nothing starts unless it is picked.
+#
+#   frank-start            # list the downloaded models and the two pages, start what you pick
+#   frank-start -c         # frank's own options pass through (here: resume the last session)
+#   frank-start --server   # start what you pick and stop there, without the agent
+#
+# One model serves at a time, on PORT, so picking another stops the one there. It starts the
+# way the control page switches to it (spark/service.sh switch or spark/vllm.sh switch): the
+# pick goes into config/spark.env, and a model that leaves under SAFETY_GB free once loaded is
+# stopped again.
+set -euo pipefail
+
+self=$0
+while [ -L "$self" ]; do   # follow a ~/.local/bin link back into the tree
+    link=$(readlink "$self")
+    case "$link" in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
+done
+ROOT=$(cd "$(dirname "$self")/.." && pwd)
+. "$ROOT/spark/common.sh"
+load_env
+
+agent=1 args=()
+for a in "$@"; do
+    if [ "$a" = --server ]; then agent=0; else args+=("$a"); fi
+done
+
+# The downloaded profiles as the control page sees them: backend, key, GB it wants free, title.
+mapfile -t rows < <(python3 -I - "$ROOT" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1] + "/spark")
+import panel
+rows = []
+for p in panel.profiles(panel.config()):
+    if p["downloaded"]:
+        f = panel.ROOT / "config" / ("vllm" if p["backend"] == "vllm" else "models") / (p["key"] + ".env")
+        rows.append((p["backend"], p["key"], str(p["min_free_gb"]), panel.read_env(f).get("TITLE") or p["key"]))
+for r in sorted(rows, key=lambda r: r[3].lower()):
+    print("\t".join(r))
+EOF
+)
+[ "${#rows[@]}" -gt 0 ] || die "no model is downloaded; pull one from the control page"
+
+if [ "${BACKEND:-llama}" = vllm ]; then default=vllm/${VLLM_PROFILE:-qwen3.8-27b} main=vllm.service
+else default=llama/$MODEL main=llama-server.service; fi
+current=
+if systemctl --user is-active --quiet "$main"; then current=$default; fi
+
+printf '%s of %s GB available; a model must leave %s GB free once loaded.\n' "$(mem_available_gb)" "$(mem_total_gb)" "$SAFETY_GB"
+for u in ${NEIGHBOURS-steel.service flint-run.service}; do   # the jobs the bake gives way to
+    if systemctl --user is-active --quiet "$u"; then
+        warn "$u is running and takes more memory as it goes; leave it room"
+    fi
+done
+echo
+dflt=
+for i in "${!rows[@]}"; do
+    IFS=$'\t' read -r backend key need title <<<"${rows[$i]}"
+    note=
+    if [ "$backend/$key" = "$current" ]; then note="  (running)"; fi
+    if [ "$backend/$key" = "${current:-$default}" ]; then dflt=$((i + 1)); fi
+    b=${backend/vllm/vLLM}
+    printf '  %2d  %-38s %-9s %3s GB%s\n' $((i + 1)) "$title" "${b/llama/llama.cpp}" "$need" "$note"
+done
+echo
+for page in "p frank-panel.service control page, :${PANEL_PORT:-8088}" "c frank-chat.service chat page, :8089"; do
+    read -r letter unit label <<<"$page"
+    note=
+    if systemctl --user is-active --quiet "$unit"; then note="  (running)"; fi
+    printf '   %s  %s%s\n' "$letter" "$label" "$note"
+done
+echo
+
+# Enter takes the default; anything typed is exactly what starts ("c" alone: the chat page only).
+pick=$dflt pages=()
+while [ -t 0 ]; do
+    read -r -p "Start which? One model number and/or p, c [${dflt:-nothing}]: " reply
+    pick=$dflt pages=() bad=
+    [ -n "$reply" ] || break
+    pick=
+    for w in ${reply//,/ }; do
+        case "$w" in
+            p) pages+=(frank-panel.service) ;;
+            c) pages+=(frank-chat.service) ;;
+            *[!0-9]*) bad="$w is not on the list" ;;
+            *) if [ -n "$pick" ]; then bad="one model at a time: they share :$PORT"
+               elif [ "$w" -lt 1 ] || [ "$w" -gt "${#rows[@]}" ]; then bad="$w is not on the list"
+               else pick=$w; fi ;;
+        esac
+    done
+    [ -n "$bad" ] || break
+    echo "$bad" >&2
+done
+
+if [ -n "$pick" ]; then
+    IFS=$'\t' read -r backend key need title <<<"${rows[$((pick - 1))]}"
+    if [ "$backend/$key" != "$current" ]; then
+        # with nothing loaded, what is free now is what the model gets
+        if [ -z "$current" ] && [ "$(mem_available_gb)" -lt "$need" ]; then
+            die "$title wants $need GB free and $(mem_available_gb) GB is; spark/preflight.sh shows what is using it"
+        fi
+        log "starting $title"
+        if [ "$backend" = vllm ]; then
+            systemctl --user stop llama-server.service 2>/dev/null || true
+            "$ROOT/spark/vllm.sh" switch "$key"
+        else
+            systemctl --user stop vllm.service 2>/dev/null || true
+            sed -i 's/^BACKEND=.*/BACKEND=llama/' "$ROOT/config/spark.env"
+            "$ROOT/spark/service.sh" switch "$key"
+        fi
+        current=$backend/$key
+    fi
+fi
+if [ "${#pages[@]}" -gt 0 ]; then
+    systemctl --user start "${pages[@]}"
+    log "started ${pages[*]}"
+fi
+
+[ "$agent" = 1 ] || exit 0
+if [ -z "$current" ]; then log "no model is running, so frank is not started"; exit 0; fi
+wait_healthy "$PORT" 900 || die "nothing answers on :$PORT; check: journalctl --user -u $main -n 100"
+exec "$ROOT/bin/frank" ${args[@]+"${args[@]}"}

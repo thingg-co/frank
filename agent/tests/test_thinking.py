@@ -131,7 +131,7 @@ def test_set_effort_rebuilds_the_prompt_only_when_it_matters(tmp_path, ui):
 
 
 class RecordingClient(FakeClient):
-    def stream(self, messages, tools=None, max_tokens=None):
+    def stream(self, messages, tools=None, max_tokens=None, stop=None):
         self.max_tokens = max_tokens
         yield from super().stream(messages, tools, max_tokens)
 
