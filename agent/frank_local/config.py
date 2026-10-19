@@ -32,7 +32,7 @@ class Settings:
     model: str = ""                       # empty: first model the server lists
     backend: Backend = "auto"            # auto: whatever the server turns out to be when probed
     max_tokens: int = 32768               # per response, thinking included; clamped to the room left in the window
-    request_timeout: int = 3600           # seconds without a byte from the server; filling a long context takes minutes
+    request_timeout: int = 300            # seconds without a byte from the server; llama.cpp streams progress while it fills a long prompt
     temperature: float | None = None     # None: server default
     context_window: int | None = None    # None: probe the server, else fall back to 32768
     min_context: int = 0                 # warn at startup (and fail --doctor) when the server's window is smaller

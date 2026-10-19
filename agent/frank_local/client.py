@@ -86,6 +86,7 @@ class StreamAccumulator:
                     slot["name"] += fn.name if not slot["name"] else ""
                 if getattr(fn, "arguments", None):
                     slot["arguments"] += fn.arguments
+            events.append(("tool", slot["name"]))  # a call being written: something is happening
         return events
 
     def _take(self, pieces: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -212,7 +213,10 @@ class Client:
         raise RuntimeError("unreachable")
 
     def stream(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, max_tokens: int | None = None, stop: Any = None) -> Iterator[tuple[str, Any]]:
-        """Yield ('reasoning', str) | ('text', str) | ('done', Turn).
+        """Yield ('reasoning', str) | ('text', str) | ('tool', name) | ('progress', dict) | ('done', Turn).
+
+        'progress' is llama.cpp reading the prompt: total, cache, processed
+        (cache included) and time_ms, a few seconds apart until the first token.
 
         stop, when given, is called between chunks; if it returns true the
         stream is cut off there and the partial turn is yielded as usual.
@@ -220,6 +224,10 @@ class Client:
         kw = self._kwargs(messages, tools, max_tokens)
         kw["stream"] = True
         kw["stream_options"] = {"include_usage": True}
+        if self.settings.backend == "llama.cpp":
+            # Progress chunks while the prompt fills keep bytes coming, so a long
+            # cold prompt does not look like a dead server to request_timeout.
+            kw["extra_body"]["return_progress"] = True
         acc = StreamAccumulator()
         turn = Turn()
         stream = self._call(self._oa.chat.completions.create, **kw)
@@ -230,6 +238,9 @@ class Client:
                 if getattr(chunk, "usage", None):
                     u = chunk.usage
                     turn.usage = {"prompt_tokens": u.prompt_tokens or 0, "completion_tokens": u.completion_tokens or 0}
+                progress = (getattr(chunk, "model_extra", None) or {}).get("prompt_progress")
+                if isinstance(progress, dict):
+                    yield ("progress", progress)
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -249,7 +260,10 @@ class Client:
         yield ("done", turn)
 
     def complete(self, messages: list[dict[str, Any]], max_tokens: int | None = None, tools: list[dict[str, Any]] | None = None) -> str:
-        """Non-streaming text completion (used for compaction summaries)."""
-        kw = self._kwargs(messages, tools, max_tokens)
-        resp = self._call(self._oa.chat.completions.create, **kw)
-        return thinking.strip_think(resp.choices[0].message.content or "").strip()
+        """Text completion (used for compaction summaries). Streamed underneath,
+        so the same silence timeout applies as for a turn."""
+        turn = Turn()
+        for kind, value in self.stream(messages, tools, max_tokens):
+            if kind == "done":
+                turn = value
+        return thinking.strip_think(turn.text or "").strip()

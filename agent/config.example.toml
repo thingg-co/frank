@@ -12,7 +12,7 @@ thinking = "auto"                       # auto | native | prompted | off. native
 permission_mode = "ask"                 # ask | auto | readonly
 allowed_commands = ["uv run pytest", "pytest", "npm test", "make test", "cargo test", "go test"]
 max_tokens = 32768                      # per response, thinking included; clamped to what the window has left
-request_timeout = 3600                  # seconds of silence tolerated; a cold 1M-token prompt takes minutes to fill
+request_timeout = 300                   # seconds of silence tolerated; llama.cpp sends progress while it fills a prompt
 # max_tool_output_chars = 30000         # default: a tenth of the context window per tool result
 # context_window = 262144               # normally probed from the server
 min_context = 500000                    # complain when the server offers less than this
@@ -20,7 +20,7 @@ compact_threshold = 0.75                # summarise history past this share of t
 show_thinking = false
 send_reasoning_back = true              # keep the model's thinking in the history; false saves context
 max_iterations = 100                    # tool rounds per message
-bash_timeout = 120
+bash_timeout = 120                      # seconds a shell command may run unless the model asks for more (up to 600)
 max_subagent_depth = 1
 
 # Route subagents to the small fast model on the second port:

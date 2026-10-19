@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 
 from rich.console import Console
@@ -17,7 +20,7 @@ from . import __version__, thinking
 from .client import Client, ContextOverflow
 from .config import Settings, load_settings
 from .loop import Agent, TurnInterrupted
-from .render import UI, fmt_tokens
+from .render import UI, Activity, fmt_secs, fmt_tokens
 from .session import Session, SessionBusy, load_titles
 from .tools.todo import render_todos
 
@@ -50,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--effort", choices=list(thinking.LEVELS), help="thinking depth (default high)")
     p.add_argument("--think", action="store_true", help="show the model's reasoning as it streams")
     p.add_argument("-c", "--continue", dest="cont", action="store_true", help="resume the latest session for this directory")
-    p.add_argument("-r", "--resume", metavar="ID", help="resume a session by id prefix")
+    p.add_argument("-r", "--resume", nargs="?", const="", metavar="ID", help="resume a session by id prefix, or the latest for this directory")
     p.add_argument("--cwd", help="working directory for the agent")
     p.add_argument("--max-turns", type=int, help="tool rounds per user message")
     p.add_argument("--doctor", action="store_true", help="check the server: models, context, speed, tool calling")
@@ -120,11 +123,16 @@ def main(argv: list[str] | None = None) -> int:
     agent = Agent(settings, client, ui, cwd, context_window=window)
 
     session = None
-    if args.resume:
-        session = Session.find(settings.home, args.resume)
-        if session is None:
-            ui.error(f"no session starting with {args.resume}")
-            return 2
+    if args.resume is not None:
+        if args.resume:
+            session = Session.find(settings.home, args.resume)
+            if session is None:
+                ui.error(f"no session starting with {args.resume}")
+                return 2
+        else:  # --resume with no id: the latest for this directory, like -c
+            session = Session.latest(settings.home, cwd)
+            if session is None:
+                ui.warn("no previous session for this directory; starting fresh")
     elif args.cont:
         session = Session.latest(settings.home, cwd)
         if session is None:
@@ -165,199 +173,420 @@ def thinking_label(settings: Settings, model: str) -> str:
     return "off" if kind == "off" else f"{settings.reasoning_effort} ({kind})"
 
 
+# Escape sequences and carriage returns, dropped from the live preview of a half-written line.
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r")
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class LineWriter:
+    """sys.stdout during the interactive session. Whole lines go to the terminal
+    above the prompt, through prompt_toolkit's proxy, which redraws the prompt
+    under them. A line still being written is held back, so nothing is ever
+    drawn over the prompt, and shown live under the conversation instead."""
+
+    def __init__(self, sink, changed=lambda: None) -> None:
+        self.sink = sink
+        self.changed = changed
+        self.tail = ""
+        self._lock = threading.Lock()
+
+    def write(self, data: str) -> int:
+        with self._lock:
+            head, nl, self.tail = (self.tail + data).rpartition("\n")
+            if nl:
+                self.sink.write(head + nl)
+        self.changed()
+        return len(data)
+
+    def flush(self) -> None:
+        pass  # rich flushes after every print; a half line waits for the rest of it
+
+    def isatty(self) -> bool:
+        return True  # rich picked its colours when the console was built
+
+    def close_line(self) -> None:
+        """At the end of the session: a line left unfinished goes out too."""
+        with self._lock:
+            tail, self.tail = self.tail, ""
+        if tail:
+            self.sink.write(tail + "\n")
+
+    def preview(self, width: int, lines: int = 4) -> str:
+        """The end of the unfinished line, plain, at most this many rows of the screen."""
+        text = ANSI_ESCAPE.sub("", self.tail)
+        keep = max(20, width) * lines
+        return text if len(text) <= keep else "…" + text[-keep + 1:]
+
+
+def describe(a: Activity, now: float) -> str:
+    """The status line while the agent works: the step, how long, how far along."""
+    if not a.what:
+        return ""
+    parts = [a.what, fmt_secs(now - a.since)]
+    if a.what.endswith("reading the prompt") and a.total:
+        new_total = max(1, a.total - a.cached)
+        new_done = min(new_total, max(0, a.done - a.cached))
+        part = f"{fmt_tokens(new_done)}/{fmt_tokens(new_total)} tokens ({100 * new_done // new_total}%)"
+        if a.cached:
+            part += f", {fmt_tokens(a.cached)} cached"
+        parts.append(part)
+        if new_done and a.took_ms:
+            left = (new_total - new_done) / (new_done / (a.took_ms / 1000))
+            if left >= 1:
+                parts.append(f"about {fmt_secs(left)} left")
+    elif a.tokens:
+        dt = now - a.since
+        parts.append(f"{a.tokens} token{'s' if a.tokens != 1 else ''}" + (f" ({a.tokens / dt:.0f}/s)" if dt >= 2 else ""))
+    if a.turn_since and a.since - a.turn_since >= 1:
+        parts.append(f"{fmt_secs(now - a.turn_since)} in all")
+    return " · ".join(parts)
+
+
 def repl(agent: Agent, ui: UI, settings: Settings, info: dict) -> int:
     import queue
-    import threading
 
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit import Application
+    from prompt_toolkit.application import get_app
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.filters import Condition
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, VSplit, Window
+    from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
     from prompt_toolkit.patch_stdout import StdoutProxy
+    from prompt_toolkit.styles import Style
 
     settings.home.mkdir(parents=True, exist_ok=True)
-    ps: PromptSession = PromptSession(history=FileHistory(str(settings.home / "history")))
+    activity = ui.activity
 
-    # Esc alone stops a running turn like Ctrl-C (it raises KeyboardInterrupt,
-    # same as the key). What to do with a message typed while a turn runs is
-    # picked at the prompt after Enter, not by key combinations.
-    kb = KeyBindings()
+    # The conversation is printed into the terminal itself, so its scrollback,
+    # search and copying all work as usual. Under it the app keeps a few live
+    # lines: the line being written, a status line, and the input.
+    #
+    # The app and the proxy are made before sys.stdout is swapped, so both write
+    # to the real terminal. raw=True keeps rich's colours (the proxy strips
+    # escape codes otherwise).
+    lines: queue.Queue[str] = queue.Queue()
+    stop = threading.Event()
+    turns: dict[str, threading.Thread | None] = {"worker": None}
+    working = {"on": False}
+    state = {"choosing": None, "footer": ""}  # choosing: a message typed mid-turn, awaiting l/n/c
+    send_mode = ["instruction"]
 
-    @kb.add("escape")
-    def _esc(event) -> None:
-        event.app.exit(exception=KeyboardInterrupt())  # Esc = Ctrl-C
+    def running() -> bool:
+        w = turns["worker"]
+        return w is not None and w.is_alive()
 
-    def pick_send_choice() -> str:
-        """What to do with the typed message: later, next instruction, clarification."""
-        while True:
-            try:
-                ans = input("send as: [l]ater (Enter) / [n]ext instruction / [c]larification: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                return "later"
-            if not ans or ans.startswith("l"):
-                return "later"
-            if ans.startswith("n"):
-                return "next"
-            if ans.startswith("c"):
-                return "clarify"
-            ui.warn("pick l (later), n (next instruction) or c (clarification)")
+    def refresh_footer() -> None:
+        used, window = agent.tokens_used(), agent.context_window
+        state["footer"] = f"{fmt_tokens(used)}/{fmt_tokens(window)} tokens ({100 * used / window if window else 0:.0f}%)"
 
     class PermissionGate:
-        """A tool in the turn thread asks for permission; the question is shown
-        from the prompt's inputhook and the answer comes back at the prompt,
-        so the two never race over stdin."""
+        """A tool in the turn thread asks for permission; the answer is typed
+        at the prompt and handed back here."""
 
         def __init__(self) -> None:
             self.lock = threading.Lock()
-            self.request: tuple[str, str, str, queue.Queue[str]] | None = None
-            self.shown = False
+            self.request: tuple[str, queue.Queue[str]] | None = None
 
         def ask(self, name: str, summary: str, detail: str) -> str:
             reply: queue.Queue[str] = queue.Queue()
+            ui.console.print(Panel(escape(detail), title=f"{name} wants to run", border_style="yellow", expand=False))
             with self.lock:
-                self.request = (name, summary, detail, reply)
+                self.request = (name, reply)
+            app.invalidate()
             answer = reply.get()
             with self.lock:
-                if self.request is not None and self.request[3] is reply:
+                if self.request is not None and self.request[1] is reply:
                     self.request = None
-                    self.shown = False
             return answer
 
-        def pending(self) -> tuple[str, str, str, queue.Queue[str]] | None:
+        def pending(self) -> str | None:
             with self.lock:
-                return self.request
+                return self.request[0] if self.request else None
 
         def answer(self, line: str) -> bool:
-            """Route a submitted line to the waiting tool. True if one was waiting."""
+            """Route a submitted line to the waiting tool. True if one was waiting.
+            Anything but y/n/a is a no that says what to do instead: it goes to
+            the model as the next instruction."""
             with self.lock:
                 req, self.request = self.request, None
-                self.shown = False
             if req is None:
                 return False
             ans = line.strip().lower()
-            req[3].put("y" if ans in ("y", "yes") else "a" if ans in ("a", "always") else "n")
+            if ans not in ("", "y", "yes", "n", "no", "a", "always"):
+                agent._interrupt("instruction", line.strip())  # before the tool hears no, so the turn sees it
+                ui.info(f"{req[0]} not allowed; your message goes to the model instead")
+            req[1].put("y" if ans in ("y", "yes") else "a" if ans in ("a", "always") else "n")
             return True
 
     gate = PermissionGate()
     ui.permission_router = gate.ask
 
-    def inputhook(ctx) -> None:
-        """Called whenever the prompt waits for input: put the permission
-        question on screen. The answer is typed at the prompt itself."""
-        if ctx.input_is_ready():
-            return
-        with gate.lock:
-            req = gate.request
-            show = req is not None and not gate.shown
-            if show:
-                gate.shown = True
-        if show:
-            name, summary, detail, _ = req
-            ui.turn_end()
-            ui.console.print(Panel(escape(detail), title=f"{name} wants to run", border_style="yellow", expand=False))
-            ui.console.print("[yellow]allow?[/yellow] [y]es / [n]o / [a]lways for this tool (answer at the prompt): ")
+    def prompt_text() -> str:
+        if gate.pending() is not None:
+            return "allow [y/n/a]> "
+        if state["choosing"] is not None:
+            return "send as [l/n/c]> "
+        return "> "
+
+    def status_left():
+        name = gate.pending()
+        if name is not None:
+            return [("class:ask", f" {name} is waiting for you: y yes · n no · a always for this tool · or say what to do instead")]
+        if state["choosing"] is not None:
+            return [("class:ask", " send it as: l later, when this turn ends (Enter) · n the next instruction, now · c a clarification")]
+        now = time.time()
+        text = describe(activity, now)
+        if not text:
+            return ""
+        line = [("class:spinner", f"{SPINNER[int(now * 8) % len(SPINNER)]} "), ("class:status", text)]
+        if activity.what.endswith("thinking") and activity.snippet and not ui.show_thinking:
+            line.append(("class:snippet", "  " + " ".join(activity.snippet.split())[-80:]))  # a glimpse of the reasoning
+        return line
+
+    def status_right():
+        if working["on"]:
+            return [("class:hint", " esc to interrupt ")]
+        return [("class:hint", f" {state['footer']} ")]
+
+    # Ctrl-C and Esc stop a running turn; Ctrl-D on an empty line exits. Esc is
+    # not eager, so Esc+Enter still reads as Alt+Enter (a clarification); Esc
+    # alone lands after timeoutlen (see pre_run).
+    kb = KeyBindings()
+
+    def interrupt() -> bool:
+        if gate.pending() is not None:
+            gate.answer("n")  # stop asking: the tool is denied
+            return True
+        if working["on"]:
+            agent._stop()
+            activity.step("stopping")
+            return True
+        return False
+
+    @kb.add("c-c", eager=True)
+    def _ctrl_c(event) -> None:
+        if not interrupt():
+            event.current_buffer.reset()
+
+    @kb.add("escape")
+    def _esc(event) -> None:
+        interrupt()
+
+    @kb.add("c-d", eager=True, filter=Condition(lambda: not buf.text))
+    def _eof(event) -> None:
+        event.app.exit()
+
+    # Enter sends a line; Alt+Enter while a turn runs sends it as a
+    # clarification at once. The prompt worker reads the flag.
+    @kb.add("enter")
+    def _enter(event) -> None:
+        send_mode[0] = "instruction"
+        event.current_buffer.validate_and_handle()
+
+    @kb.add("escape", "enter")
+    @kb.add("escape", "c-j")  # some terminals send LF, not CR, for Enter
+    def _alt_enter(event) -> None:
+        send_mode[0] = "clarification"
+        event.current_buffer.validate_and_handle()
+
+    def accept(b: Buffer) -> bool:
+        # Echo what was typed into the conversation, as typed, then hand it over.
+        b.append_to_history()
+        ui.console.print(f"[bold green]{escape(prompt_text())}[/bold green]{escape(b.text)}")
+        lines.put(b.text)
+        return False  # clears the input
+
+    buf = Buffer(history=FileHistory(str(settings.home / "history")), multiline=False, accept_handler=accept)
+
+    writer: LineWriter  # set below, once the app exists
+    layout = Layout(
+        HSplit([
+            ConditionalContainer(
+                Window(FormattedTextControl(lambda: writer.preview(get_app().output.get_size().columns)), wrap_lines=True),
+                filter=Condition(lambda: bool(writer.tail)),
+            ),
+            VSplit([
+                Window(FormattedTextControl(status_left), height=1),
+                Window(FormattedTextControl(status_right), height=1, dont_extend_width=True),
+            ]),
+            VSplit([
+                Window(FormattedTextControl(lambda: [("class:prompt", prompt_text())]), dont_extend_width=True),
+                Window(BufferControl(buffer=buf), wrap_lines=True),
+            ]),
+        ]),
+        focused_element=buf,
+    )
+    style = Style.from_dict({
+        "prompt": "bold ansigreen",
+        "spinner": "ansicyan",
+        "status": "",
+        "snippet": "italic ansibrightblack",
+        "hint": "ansibrightblack",
+        "ask": "ansiyellow",
+    })
+
+    def pre_run() -> None:
+        get_app().timeoutlen = 0.4  # Esc alone lands promptly; Esc+Enter still reads as Alt+Enter
+
+    app = Application(
+        layout=layout,
+        key_bindings=kb,
+        style=style,
+        erase_when_done=True,     # the live lines go; the conversation stays on the terminal
+        refresh_interval=0.25,    # the spinner and the clocks in the status line
+        min_redraw_interval=0.05,
+    )
+    proxy = StdoutProxy(sleep_between_writes=0.05, raw=True)
+    writer = LineWriter(proxy, changed=app.invalidate)
 
     def turn_worker(first: str) -> None:
         """Runs the turns. An interrupt with a message becomes the next turn's
         user message; a clarification is labelled as such for the model."""
         text = first
-        while True:
-            try:
-                agent.run_turn(text)
-                break
-            except TurnInterrupted as e:
-                if not e.mode:
-                    break
-                text = f"Clarification: {e.text}" if e.mode == "clarification" else e.text
-                continue
-            except SessionBusy as e:
-                ui.error(f"a turn is running in this session in {e}; try again when it is done")
-                break
-            except ContextOverflow as e:
-                ui.error(f"context overflow even after compaction: {e}")
-                break
-            except Exception as e:  # keep the session alive
-                ui.error(f"{type(e).__name__}: {e}")
-                break
-        ui.status(agent.tokens_used(), agent.context_window)
-
-    def running() -> bool:
-        return worker is not None and worker.is_alive()
-
-    mode = {"ask": "ask before changes", "auto": "auto-approve", "readonly": "read-only"}[settings.permission_mode]
-    ui.console.print(
-        f"👽 [bold]frank[/bold] {__version__} · {agent.client.model} @ {agent.client.base_url} · "
-        f"ctx {fmt_tokens(agent.context_window)} · thinking {thinking_label(settings, agent.client.model)} · {mode} · session {agent.session.id if agent.session else '-'}"
-    )
-    ui.console.print("[dim]/help for commands, Ctrl-C or Esc interrupts a turn, Ctrl-D exits[/dim]")
-    ui.console.print("[dim]while a turn runs: type + Enter, then pick later / next instruction / clarification; empty Enter sends a queued message now[/dim]")
-
-    # Output above the live prompt goes through a proxy that redraws the prompt.
-    # The proxy is created here so it owns the terminal for the whole session.
-    worker: threading.Thread | None = None
-    with StdoutProxy(sleep_between_writes=0.0) as proxy:
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = sys.stderr = proxy
+        working["on"] = True
+        activity.begin_turn()
+        t0 = time.time()
+        ended = "done in"
         try:
             while True:
                 try:
-                    line = ps.prompt(HTML("<b><ansigreen>&gt; </ansigreen></b>"), key_bindings=kb, inputhook=inputhook).strip()
-                except EOFError:
-                    if running():
-                        agent._stop()
-                        worker.join(timeout=10)
+                    agent.run_turn(text)
                     break
-                except KeyboardInterrupt:  # Ctrl-C and Esc both land here
-                    if gate.pending() is not None:
-                        gate.answer("n")  # stop asking: the tool is denied
-                    elif running():
-                        agent._stop()
-                        ui.warn("interrupting; send a message at the prompt or press Enter to stop")
+                except TurnInterrupted as e:
+                    if not e.mode:
+                        ended = "stopped after"
+                        break
+                    text = f"Clarification: {e.text}" if e.mode == "clarification" else e.text
                     continue
-                if gate.pending() is not None:
-                    gate.answer(line)
-                    continue
-                if running():
-                    if line.startswith("/"):
-                        ui.warn("a turn is running; interrupt it first (Ctrl-C or Esc), then use commands")
-                        continue
-                    if not line:
-                        if agent.has_pending():
-                            agent._send_now()
-                            ui.info("sending queued message now")
-                        continue
-                    choice = pick_send_choice()
-                    if choice == "clarify":
-                        agent._interrupt("clarification", line)
-                        ui.info("interrupt sent as a clarification")
-                    elif choice == "next":
-                        agent._interrupt("instruction", line)
-                        ui.info("interrupt sent as the next instruction")
-                    else:
-                        agent._queue_later(line)
-                        ui.info("queued — will send when this turn finishes; press Enter again to send now")
+                except SessionBusy as e:
+                    ui.error(f"a turn is running in this session in {e}; try again when it is done")
+                    ended = "failed after"
+                    break
+                except ContextOverflow as e:
+                    ui.error(f"context overflow even after compaction: {e}")
+                    ended = "failed after"
+                    break
+                except Exception as e:  # keep the session alive
+                    ended = "failed after"
+                    msg = f"{type(e).__name__}: {e}"
+                    ui.error(msg)
+                    # A dead turn is otherwise silent: the session file ends mid-turn and
+                    # nothing says why. Record it so the transcript and the web page
+                    # (which ignores non-message records) can show what happened.
+                    if agent.session:
+                        agent.session.append({
+                            "type": "error",
+                            "what": msg,
+                            "traceback": traceback.format_exc(),
+                            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                    break
+        finally:
+            working["on"] = False
+            activity.end_turn()
+            refresh_footer()
+        ui.status(agent.tokens_used(), agent.context_window, lead=f"{ended} {fmt_secs(time.time() - t0)}")
+
+    def start_turn(text: str) -> None:
+        turns["worker"] = threading.Thread(target=turn_worker, args=(text,), daemon=True, name="frank-turn")
+        turns["worker"].start()
+
+    def prompt_worker() -> None:
+        """Owns the prompt logic: answers to the permission gate, the l/n/c
+        choice for a message typed mid-turn, commands, and starting turns.
+        The app itself only accepts lines and hands them here."""
+        while True:
+            try:
+                line = lines.get(timeout=0.2)
+            except queue.Empty:
+                if stop.is_set():
+                    return
+                continue
+            line = line.strip()
+            if gate.answer(line):
+                continue
+            if state["choosing"] is not None:
+                message, state["choosing"] = state["choosing"], None
+                choice = line.lower()
+                if not running():  # the turn ended while the choice was open: just send it
+                    agent._reset_interrupt()
+                    start_turn(message)
+                elif not choice or choice.startswith("l"):
+                    agent._queue_later(message)
+                    ui.info("queued — it goes when this turn finishes; an empty Enter sends it now")
+                elif choice.startswith("n"):
+                    agent._interrupt("instruction", message)
+                    ui.info("sent as the next instruction")
+                elif choice.startswith("c"):
+                    agent._interrupt("clarification", message)
+                    ui.info("sent as a clarification")
+                else:
+                    ui.warn("pick l (later), n (next instruction) or c (clarification)")
+                    state["choosing"] = message  # ask again
+                continue
+            if running():
+                if line.startswith("/"):
+                    ui.warn("a turn is running; interrupt it first (Ctrl-C or Esc), then use commands")
                     continue
                 if not line:
+                    if agent.has_pending():
+                        agent._send_now()
+                        ui.info("sending the queued message now")
                     continue
-                if line.startswith("/"):
+                if send_mode[0] == "clarification":
+                    agent._interrupt("clarification", line)
+                    ui.info("sent as a clarification")
+                    continue
+                state["choosing"] = line
+                continue
+            if not line:
+                continue
+            if line.startswith("/"):
+                try:
                     if handle_command(line, agent, ui, settings) is False:
-                        break
-                    continue
-                pending = agent._drain()  # a message queued as the last turn ended
-                if pending is not None:
-                    mode, text = pending
-                    if mode == "clarification":
-                        text = f"Clarification: {text}"
-                    worker = threading.Thread(target=turn_worker, args=(text,), daemon=True, name="frank-turn")
-                    worker.start()
-                    if line:
-                        agent._queue_later(line)
-                    continue
-                agent._reset_interrupt()
-                worker = threading.Thread(target=turn_worker, args=(line,), daemon=True, name="frank-turn")
-                worker.start()
-        finally:
-            sys.stdout, sys.stderr = old_out, old_err
+                        app.loop.call_soon_threadsafe(app.exit)
+                        return
+                finally:
+                    activity.end_turn()  # /compact leaves its step behind
+                    refresh_footer()
+                continue
+            pending = agent._drain()  # a message queued as the last turn ended
+            if pending is not None:
+                mode, text = pending
+                start_turn(f"Clarification: {text}" if mode == "clarification" else text)
+                agent._queue_later(line)
+                continue
+            agent._reset_interrupt()
+            start_turn(line)
+
+    mode = {"ask": "ask before changes", "auto": "auto-approve", "readonly": "read-only"}[settings.permission_mode]
+    refresh_footer()
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = sys.stderr = writer
+    worker_thread = threading.Thread(target=prompt_worker, daemon=True, name="frank-prompt")
+    worker_thread.start()
+    try:
+        ui.console.print(
+            f"👽 [bold]frank[/bold] {__version__} · {agent.client.model} @ {agent.client.base_url} · "
+            f"ctx {fmt_tokens(agent.context_window)} · thinking {thinking_label(settings, agent.client.model)} · {mode} · session {agent.session.id if agent.session else '-'}"
+        )
+        ui.console.print("[dim]/help for commands · Esc or Ctrl-C interrupts a turn · Ctrl-D exits[/dim]")
+        ui.console.print("[dim]type while a turn runs to queue a message, steer it, or clarify (Alt+Enter)[/dim]")
+        try:
+            app.run(pre_run=pre_run)
+        except (EOFError, KeyboardInterrupt):
+            pass
+    finally:
+        stop.set()
+        worker_thread.join(timeout=5)
+        if running():
+            agent._stop()  # Ctrl-D mid-turn: end the turn too
+            turns["worker"].join(timeout=10)
+        sys.stdout, sys.stderr = old_out, old_err
+        writer.close_line()
+        proxy.close()
     return 0
 
 

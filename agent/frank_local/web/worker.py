@@ -127,6 +127,15 @@ class WebUI:
     def turn_end(self) -> None:
         pass
 
+    def phase(self, what: str) -> None:
+        pass
+
+    def tool_progress(self, name: str) -> None:
+        pass
+
+    def progress(self, done: int, total: int, cached: int = 0, took_ms: int = 0) -> None:
+        pass
+
     def tool_call(self, name: str, summary: str) -> None:
         emit({"type": "tool", "depth": self.depth, "name": name, "summary": summary})
 

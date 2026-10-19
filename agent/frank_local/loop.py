@@ -233,11 +233,17 @@ class Agent:
         turn: Turn | None = None
         # never ask for more than the window has left, or the server rejects the request
         room = self.context_window - max(self.tokens_used(), self.estimate_tokens()) - 2048
+        self.ui.phase("waiting for the model")
         for kind, payload in self.client.stream(self.messages, tools, max_tokens=max(1024, min(self.settings.max_tokens, room)), stop=self.interrupt.is_set):
             if kind == "text":
                 self.ui.text(payload)
             elif kind == "reasoning":
                 self.ui.reasoning(payload)
+            elif kind == "tool":
+                self.ui.tool_progress(payload)
+            elif kind == "progress":
+                self.ui.progress(int(payload.get("processed") or 0), int(payload.get("total") or 0),
+                                 int(payload.get("cache") or 0), int(payload.get("time_ms") or 0))
             elif kind == "done":
                 turn = payload
         self.ui.turn_end()
@@ -330,6 +336,7 @@ class Agent:
 
     def compact(self, hard: bool = False) -> None:
         self.ui.info("compacting context...")
+        self.ui.phase("compacting the conversation")
         # a longer window earns a longer summary: 800 words at 128k, 6400 at 1M
         out_tokens = max(2048, min(16384, self.context_window // 64))
         brief = prompts.load("compact").format(words=out_tokens * 800 // 2048)

@@ -54,8 +54,34 @@ it. The system prompt is built once per session for the same reason: anything
 that changes it, including `/effort` on a model that is prompted to think,
 makes the server process the whole history again.
 
-Sessions are JSONL files under `.frank/sessions/`; `-c` resumes the latest for
-the current directory and `-r ID` a specific one. `--sessions` lists them.
+Sessions are JSONL files under `.frank/sessions/`; `-c` or `--resume` (no id)
+resumes the latest for the current directory, `-r ID` a specific one, and
+`--sessions` lists them.
+
+In the terminal the conversation prints into the terminal itself, so
+scrollback, search and copying work as they always do, and quitting leaves it
+there. Only finished lines are printed; the line being written shows under the
+conversation until it is done. Below that a status line says what is going on:
+waiting for the model, the server reading the prompt (how far, how much was
+cached, how long is left), thinking (for how long, how many tokens, and the
+latest bit of the reasoning), writing, or the tool that is running. Thinking
+leaves a "thought for 40s" line behind; `--think` or `/think` shows all of it.
+
+![frank at work: a failed test above, the status line showing the model thinking](../docs/frank-status.png)
+
+Esc or Ctrl-C stops a turn, and Ctrl-D on an empty line exits. A message typed
+while a turn runs asks whether it goes later (when the turn ends), as the next
+instruction (now), or as a clarification; Alt+Enter sends it as a
+clarification straight away. A permission question takes y, n or a (always for
+this tool), or a sentence, which says no and goes to the model as what to do
+instead.
+
+Timeouts: `request_timeout` (300 s) is how long the agent waits for the next
+byte from the server. llama.cpp is asked for progress while it reads a prompt,
+which arrives every few seconds even for a cold million tokens, so only a stuck
+server runs into it; vLLM and Ollama send nothing until the first token, so
+raise it there if a long cold prompt needs more. A shell command gets
+`bash_timeout` (120 s) unless the model asks for longer, up to 600.
 
 `frank --web` serves the same sessions as a chat page in the browser, on
 http://127.0.0.1:8089 (`--host` and `--port` change that; `web_host` and
